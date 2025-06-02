@@ -1,0 +1,450 @@
+//--------------------------------------------------------------------------------------------------
+// Product:        DrinkGuard Interactive Coaster v5
+// Focus:          Arming system with timer, 3D coaster puck & glass visualization,
+//                 experimental lift detection, UI/UX refinements.
+// Revision Notes: Replaced reset with Arm System. Added 10-min timer.
+//                 Redesigned 3D model to be a thin coaster + glass.
+//                 Added experimental Z-axis lift detection.
+//                 UI updates for armed state, timer, and clarity.
+//--------------------------------------------------------------------------------------------------
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <cmath>
+#include <cstdio>
+
+#if defined(ESP32)
+  #include <WiFi.h>
+  #include <WebServer.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+#else
+  #error "Board not supported."
+#endif
+
+// --- Configuration ---
+const char* WIFI_SSID     = "DevilDogVIP"; // Your WiFi SSID
+const char* WIFI_PASSWORD   = "yvetteway";   // Your WiFi Password
+
+const int I2C_SDA_PIN = 22;
+const int I2C_SCL_PIN = 21;
+#if defined(ESP32)
+  const int LED_PIN = 13;
+#elif defined(ESP8266)
+  const int LED_PIN = 2; // D4 on NodeMCU
+#else
+  const int LED_PIN = LED_BUILTIN;
+#endif
+
+// --- Fixed Sensitivity Settings ---
+const float DEFAULT_TILT_THRESHOLD_DEGREES        = 4.0f;
+const unsigned long DEFAULT_SUSTAINED_TILT_DURATION_MS = 500;
+const float DEFAULT_SLIDE_MAGNITUDE_THRESHOLD_ACCEL = 0.7f; // m/s^2
+const unsigned long DEFAULT_SUSTAINED_SLIDE_DURATION_MS= 1000;
+const float DEFAULT_LIFT_ACCEL_THRESHOLD_G        = 0.15f; // Gs of deviation from 1G (approx 1.47 m/s^2)
+const unsigned long DEFAULT_SUSTAINED_LIFT_DURATION_MS = 400; // ms for sustained lift
+
+// System Parameters
+const float GRAVITY_MS2 = 9.80665f;
+const unsigned long TELEMETRY_READ_INTERVAL_MS = 50;    // Sensor read frequency (20Hz)
+const unsigned long WEB_PAGE_REFRESH_INTERVAL_MS = 120; // UI refresh (Slightly slower for potential visual smoothing)
+const unsigned long WEB_MOTION_INDICATOR_DURATION_MS = 3000; // How long UI shows alert after event stops
+const unsigned long LED_MOTION_INDICATOR_DURATION_MS = 2000;
+const unsigned long ARMED_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
+// Global Objects & State
+Adafruit_MPU6050 mpu;
+WebServer server(80);
+
+sensors_event_t currentAcceleration, currentGyro, currentTemperature;
+float currentRoll_deg = 0.0, currentPitch_deg = 0.0, currentYaw_deg = 0.0;
+float baseRoll_deg = 0.0, basePitch_deg = 0.0, baseAccelZ_ms2 = GRAVITY_MS2;
+bool systemArmed = false;
+unsigned long armStartTime_ms = 0;
+long timeRemaining_s = 0;
+
+unsigned long lastMotionTimestamp_ms = 0;
+bool webShowsMotionActive = false; // True if a motion event is currently being indicated
+bool ledIndicatesMotion = false;
+bool isSustainedTilt = false;
+bool isSustainedSlide = false;
+bool isSustainedLift = false; // New state for lift
+String lastMotionType = "None";
+
+unsigned long sustainedTiltStartTime_ms = 0;
+unsigned long sustainedSlideStartTime_ms = 0;
+unsigned long sustainedLiftStartTime_ms = 0; // Timer for lift detection
+
+void initializeSensor();
+void initializeNetworkServices();
+void processSensorData();
+void detectSustainedMotionEvents();
+void updateSystemIndicators(unsigned long currentTime);
+void manageLedIndicator();
+void serveRootPage();
+void handleArmSystem();
+void handleDisarmSystem();
+void serveNotFound();
+
+void setup(void) {
+  Serial.begin(115200);
+  unsigned long setupStartTime = millis();
+  while (!Serial && (millis() - setupStartTime < 2000));
+
+  Serial.println("\n[DrinkGuard Interactive Coaster v5]");
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  initializeSensor();
+  processSensorData(); // Get initial readings to prevent first read spike issues
+
+  initializeNetworkServices();
+
+  Serial.println("[SYSTEM] Sensitivity Settings:");
+  Serial.printf("  Tilt: %.1f deg, %lu ms\n", DEFAULT_TILT_THRESHOLD_DEGREES, DEFAULT_SUSTAINED_TILT_DURATION_MS);
+  Serial.printf("  Slide: %.2f m/s^2, %lu ms\n", DEFAULT_SLIDE_MAGNITUDE_THRESHOLD_ACCEL, DEFAULT_SUSTAINED_SLIDE_DURATION_MS);
+  Serial.printf("  Lift: %.2f G, %lu ms\n", DEFAULT_LIFT_ACCEL_THRESHOLD_G, DEFAULT_SUSTAINED_LIFT_DURATION_MS);
+  Serial.println("[SYSTEM] Initialization Complete. Ready to Arm.");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Dashboard: http://"); Serial.println(WiFi.localIP());
+  }
+}
+
+void loop() {
+  server.handleClient();
+  unsigned long currentTime_ms = millis();
+  static unsigned long lastTelemetryReadTime_ms = 0;
+
+  if (currentTime_ms - lastTelemetryReadTime_ms >= TELEMETRY_READ_INTERVAL_MS) {
+    lastTelemetryReadTime_ms = currentTime_ms;
+    processSensorData();
+    if (systemArmed) {
+      detectSustainedMotionEvents();
+    }
+  }
+
+  if (systemArmed) {
+    if (currentTime_ms - armStartTime_ms >= ARMED_DURATION_MS) {
+      systemArmed = false; // Auto-disarm after timer expires
+      isSustainedTilt = false; isSustainedSlide = false; isSustainedLift = false; // Clear motion states
+      lastMotionType = "None";
+      Serial.println("[SYSTEM] Armed duration expired. System DISARMED.");
+    }
+    timeRemaining_s = (ARMED_DURATION_MS - (currentTime_ms - armStartTime_ms)) / 1000;
+    if (timeRemaining_s < 0) timeRemaining_s = 0;
+  } else {
+    timeRemaining_s = 0;
+  }
+
+  updateSystemIndicators(currentTime_ms);
+  manageLedIndicator();
+  delay(1);
+}
+
+void initializeSensor() {
+  Serial.println("  Initializing MPU6050 Sensor...");
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!mpu.begin()) {
+    Serial.println(">>> CRITICAL: MPU6050 FAILED. HALTED. <<<");
+    while (true) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(100); }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("  MPU6050 Initialized.");
+  delay(100);
+}
+
+void initializeNetworkServices() {
+  Serial.print("  Connecting to WiFi: "); Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifi_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 30) {
+    delay(500); Serial.print("."); wifi_attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n  WiFi Connected. IP: " + WiFi.localIP().toString());
+    server.on("/", HTTP_GET, serveRootPage);
+    server.on("/armsystem", HTTP_POST, handleArmSystem);
+    server.on("/disarmsystem", HTTP_POST, handleDisarmSystem);
+    server.onNotFound(serveNotFound);
+    server.begin();
+    Serial.println("  Web Server Started.");
+  } else {
+    Serial.println("\n>>> CRITICAL: WiFi FAILED. HALTED. <<<");
+    while (true) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(200); }
+  }
+}
+
+void processSensorData() {
+  mpu.getEvent(&currentAcceleration, &currentGyro, &currentTemperature);
+
+  currentRoll_deg = atan2(currentAcceleration.acceleration.y, currentAcceleration.acceleration.z) * 180.0 / M_PI;
+  currentPitch_deg = atan2(-currentAcceleration.acceleration.x, sqrt(pow(currentAcceleration.acceleration.y, 2) + pow(currentAcceleration.acceleration.z, 2))) * 180.0 / M_PI;
+
+  if (systemArmed) { // Only update yaw if armed to keep it relative to armed state
+    float gyroZ_rad_s = currentGyro.gyro.z;
+    currentYaw_deg += gyroZ_rad_s * (TELEMETRY_READ_INTERVAL_MS / 1000.0f) * (180.0 / M_PI);
+  }
+}
+
+void handleArmSystem() {
+  Serial.println("[SYSTEM] Arming System Requested...");
+  systemArmed = true;
+  armStartTime_ms = millis();
+  timeRemaining_s = ARMED_DURATION_MS / 1000;
+
+  // Capture current orientation as baseline
+  processSensorData(); // Ensure fresh readings before setting base
+  baseRoll_deg = currentRoll_deg;
+  basePitch_deg = currentPitch_deg;
+  baseAccelZ_ms2 = currentAcceleration.acceleration.z; // Capture current Z-axis gravity reading
+  currentYaw_deg = 0.0; // Reset accumulated yaw
+
+  isSustainedTilt = false; isSustainedSlide = false; isSustainedLift = false;
+  lastMotionType = "None";
+  lastMotionTimestamp_ms = 0; // Clear any previous motion indication window
+
+  Serial.printf("System ARMED. Base R:%.1f P:%.1f, Base Z:%.2f m/s^2. Timer started.\n", baseRoll_deg, basePitch_deg, baseAccelZ_ms2);
+  server.send(200, "text/plain", "System Armed");
+}
+
+void handleDisarmSystem() {
+  Serial.println("[SYSTEM] Disarming System Requested.");
+  systemArmed = false;
+  isSustainedTilt = false; isSustainedSlide = false; isSustainedLift = false;
+  lastMotionType = "None";
+  lastMotionTimestamp_ms = 0;
+  timeRemaining_s = 0;
+  Serial.println("System DISARMED by user.");
+  server.send(200, "text/plain", "System Disarmed");
+}
+
+
+void detectSustainedMotionEvents() {
+  if (!systemArmed) return;
+
+  unsigned long currentTime = millis();
+  bool motionThisCycle = false;
+
+  // --- Tilt Detection ---
+  float effectiveRoll = currentRoll_deg - baseRoll_deg;
+  float effectivePitch = currentPitch_deg - basePitch_deg;
+  if (std::abs(effectiveRoll) > DEFAULT_TILT_THRESHOLD_DEGREES || std::abs(effectivePitch) > DEFAULT_TILT_THRESHOLD_DEGREES) {
+    if (sustainedTiltStartTime_ms == 0) sustainedTiltStartTime_ms = currentTime;
+    if (currentTime - sustainedTiltStartTime_ms >= DEFAULT_SUSTAINED_TILT_DURATION_MS) {
+      if (!isSustainedTilt) {
+        isSustainedTilt = true; motionThisCycle = true; lastMotionType = "TILT";
+        Serial.printf("[ALERT] Tilt: R:%.1f P:%.1f\n", effectiveRoll, effectivePitch);
+      }
+    }
+  } else {
+    sustainedTiltStartTime_ms = 0; isSustainedTilt = false;
+  }
+
+  // --- Slide Detection ---
+  float horizontalAccelMag = sqrt(pow(currentAcceleration.acceleration.x, 2) + pow(currentAcceleration.acceleration.y, 2));
+  if (horizontalAccelMag > DEFAULT_SLIDE_MAGNITUDE_THRESHOLD_ACCEL) {
+    if (sustainedSlideStartTime_ms == 0) sustainedSlideStartTime_ms = currentTime;
+    if (currentTime - sustainedSlideStartTime_ms >= DEFAULT_SUSTAINED_SLIDE_DURATION_MS) {
+      if (!isSustainedSlide) {
+        isSustainedSlide = true; motionThisCycle = true; lastMotionType = "SLIDE";
+        Serial.printf("[ALERT] Slide: Mag:%.2f\n", horizontalAccelMag);
+      }
+    }
+  } else {
+    sustainedSlideStartTime_ms = 0; isSustainedSlide = false;
+  }
+
+  // --- Lift Detection (Experimental) ---
+  // Check deviation from the calibrated base Z acceleration (gravity at arm time)
+  float accelZ_deviation_ms2 = std::abs(currentAcceleration.acceleration.z - baseAccelZ_ms2);
+  float liftThreshold_ms2 = DEFAULT_LIFT_ACCEL_THRESHOLD_G * GRAVITY_MS2;
+
+  if (accelZ_deviation_ms2 > liftThreshold_ms2) {
+      if (sustainedLiftStartTime_ms == 0) sustainedLiftStartTime_ms = currentTime;
+      if (currentTime - sustainedLiftStartTime_ms >= DEFAULT_SUSTAINED_LIFT_DURATION_MS) {
+          if (!isSustainedLift) {
+              isSustainedLift = true; motionThisCycle = true; lastMotionType = "LIFT";
+              Serial.printf("[ALERT] Lift: Z-Dev:%.2f m/s^2 (BaseZ:%.2f, CurrZ:%.2f)\n", accelZ_deviation_ms2, baseAccelZ_ms2, currentAcceleration.acceleration.z);
+          }
+      }
+  } else {
+      sustainedLiftStartTime_ms = 0; isSustainedLift = false;
+  }
+
+  if (motionThisCycle) {
+    lastMotionTimestamp_ms = currentTime;
+  } else { // If no specific motion type is active this cycle, but one was active before timeout
+      if (!isSustainedTilt && !isSustainedSlide && !isSustainedLift && lastMotionType != "None") {
+          // This logic will be handled by updateSystemIndicators based on timeout
+      }
+  }
+}
+
+void updateSystemIndicators(unsigned long currentTime_ms) {
+  // Check if any specific motion type is currently active
+  bool anyMotionCurrentlyActive = isSustainedTilt || isSustainedSlide || isSustainedLift;
+
+  if (anyMotionCurrentlyActive) {
+    webShowsMotionActive = true; // Keep showing active as long as a specific motion is sustained
+    // lastMotionTimestamp_ms is updated when the motion *starts*
+  } else {
+    // If no motion is currently sustained, check if we are within the display window of a *past* motion
+    if (currentTime_ms - lastMotionTimestamp_ms < WEB_MOTION_INDICATOR_DURATION_MS && lastMotionTimestamp_ms != 0) {
+      webShowsMotionActive = true; // Keep showing alert for a while after motion stops
+    } else {
+      webShowsMotionActive = false;
+      if (lastMotionType != "None") { // Only reset if there was a motion type
+          // Serial.println("[SYSTEM] Motion indication timed out.");
+          lastMotionType = "None";
+      }
+    }
+  }
+  
+  // LED indicator is simpler: on if any motion recently occurred or is active
+  ledIndicatesMotion = webShowsMotionActive;
+}
+
+
+void manageLedIndicator() {
+#if defined(ESP8266) && (LED_PIN == 2)
+  digitalWrite(LED_PIN, ledIndicatesMotion ? LOW : HIGH);
+#else
+  digitalWrite(LED_PIN, ledIndicatesMotion ? HIGH : LOW);
+#endif
+}
+
+
+void serveRootPage() {
+  String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
+  html += "<meta http-equiv='refresh' content='" + String(WEB_PAGE_REFRESH_INTERVAL_MS / 1000.0, 2) + "'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=no'>";
+  html += "<title>DrinkGuard Coaster v5</title>";
+  
+  html += "<style>";
+  html += "body{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin:0; padding:20px; background-color:#E9EBEE; color:#3D4752; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:calc(100vh - 40px); text-align:center; overflow:hidden;}";
+  html += ".container{background-color:rgba(255,255,255,0.9); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); padding:20px 25px; border-radius:24px; box-shadow:0 12px 40px rgba(0,0,0,0.12); width:90%; max-width:360px; position:relative;}";
+  html += "h1{color:#1D2C3B; margin-top:0; margin-bottom:15px; font-size:2.0em; font-weight:600;}";
+  
+  // Scene for 3D Coaster and Glass
+  html += ".scene{width:180px; height:180px; margin:15px auto; perspective:800px;}";
+  html += ".transformed-group{width:100%; height:100%; position:relative; transform-style:preserve-3d; transition: transform 0.1s linear;}"; // Group for coaster & glass
+
+  // Coaster Model (Thin Puck)
+  html += ".coaster-model{width:100px; height:100px; position:absolute; top: calc(50% - 50px); left: calc(50% - 50px); transform-style:preserve-3d; transform: translateY(20px); /* Adjust Y to place it lower for glass */}";
+  html += ".coaster-face{position:absolute; border:1px solid rgba(0,0,0,0.1); opacity:0.95; display:flex; align-items:center; justify-content:center;}";
+  // Dimensions: Width=100, Length=100 (top/bottom), Thickness=8px
+  html += ".coaster-top    {width:100px; height:100px; background:#CDD1D4; border-radius:12px; transform:rotateX(90deg) translateZ(4px);}"; // Grey top, rounded
+  html += ".coaster-bottom {width:100px; height:100px; background:#B8BCC0; border-radius:12px; transform:rotateX(-90deg) translateZ(4px);}"; // Darker grey bottom
+  html += ".coaster-front  {width:100px; height:8px; background:#C0C4C8; transform:rotateY(0deg) translateZ(50px) rotateX(0deg) translateY(0px) ;}"; // Sides
+  html += ".coaster-back   {width:100px; height:8px; background:#C0C4C8; transform:rotateY(180deg) translateZ(50px) rotateX(0deg) translateY(0px);}";
+  html += ".coaster-left   {width:8px; height:100px; background:#BDBFC3; transform:rotateY(-90deg) translateZ(50px) translateY(0px) ;}";
+  html += ".coaster-right  {width:8px; height:100px; background:#BDBFC3; transform:rotateY(90deg) translateZ(50px) translateY(0px);}";
+
+  // Glass Model (Simple Cylinder)
+  html += ".glass-model{width:60px; height:90px; position:absolute; top:calc(50% - 85px); left:calc(50% - 30px); transform-style:preserve-3d; transform:translateY(0px) translateZ(0px);}"; // Positioned on coaster
+  html += ".glass-wall{position:absolute; width:60px; height:90px; border-radius:50% / 15%; border:1.5px solid rgba(180,200,220,0.3); background:rgba(200,220,240,0.15); box-sizing:border-box;}"; // Outer wall (approximate cylinder)
+  html += ".glass-wall-segment{position:absolute; width:19.8px; height:90px; background:rgba(200,220,240,0.15); border-left:1px solid rgba(180,200,220,0.2); border-right:1px solid rgba(180,200,220,0.2);}"; // Approximation segments
+  html += ".glass-liquid{position:absolute; bottom:3px; left:calc(50% - 26px); width:52px; height:55%; background:linear-gradient(to top, #FF8A65, #FFB74D); border-radius:0 0 20px 20px; box-shadow: inset 0 -3px 6px rgba(0,0,0,0.1); opacity:0.85;}";
+  html += ".glass-base{position:absolute; bottom:0; left:calc(50% - 28px); width:56px; height:6px; background:rgba(180,200,220,0.2); border-radius:50%;}";
+
+  html += "p.status-text{font-size:1.15em; margin:18px 0; min-height:28px; font-weight:500; transition: color 0.3s ease;}";
+  html += ".status-disarmed{color:#54a0ff;} .status-armed{color:#2ecc71;} .status-alert{color:#e74c3c;}"; // Blue for disarmed, Green for armed, Red for alert
+  html += ".timer-text{font-size:0.9em; color:#57606f; margin-bottom:18px;}";
+  html += ".button-container{display:flex; justify-content:center; gap:10px; margin-top:10px;}";
+  html += "button{border:none; padding:12px 22px; border-radius:10px; font-size:0.95em; font-weight:500; cursor:pointer; transition: background-color 0.2s ease, box-shadow 0.2s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.1);}";
+  html += ".arm-button{background-color:#27AE60; color:white;} .arm-button:hover{background-color:#229954;}";
+  html += ".disarm-button{background-color:#E74C3C; color:white;} .disarm-button:hover{background-color:#C0392B;}";
+  html += ".telemetry{font-size:0.8em; color:#7f8c8d; margin-top:15px; line-height:1.4;}";
+  html += "</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>DrinkGuard v5</h1>";
+
+  html += "<div class='scene'><div id='systemPivot' class='transformed-group'>";
+  html += "<div class='coaster-model'>";
+  html += "<div class='coaster-face coaster-top'></div><div class='coaster-face coaster-bottom'></div>";
+  html += "<div class='coaster-face coaster-front'></div><div class='coaster-face coaster-back'></div>";
+  html += "<div class='coaster-face coaster-left'></div><div class='coaster-face coaster-right'></div>";
+  html += "</div>"; // end coaster-model
+  html += "<div class='glass-model'>";
+  html += "<div class='glass-wall'></div>"; // Simplified glass appearance: one semi-transparent element
+  // For more realistic cylinder, many segments would be needed:
+  // for(int i=0; i<10; ++i) { html += "<div class='glass-wall-segment' style='transform: rotateY(" + String(i*36) + "deg) translateZ(29px);'></div>"; }
+  html += "<div class='glass-liquid'></div>";
+  html += "<div class='glass-base'></div>";
+  html += "</div>"; // end glass-model
+  html += "</div></div>"; // end transformed-group, scene
+
+  html += "<p id='statusText' class='status-text'></p>";
+  html += "<p id='timerText' class='timer-text'></p>";
+  html += "<div class='button-container'>";
+  html += "<button id='armButton' class='arm-button' onclick='armSystem()'>Arm System</button>";
+  html += "<button id='disarmButton' class='disarm-button' onclick='disarmSystem()' style='display:none;'>Disarm</button>";
+  html += "</div>";
+  html += "<div id='orientationData' class='telemetry'>Roll: -- Pitch: -- Yaw: --<br>Yaw is gyro-based and will drift. Re-arm if needed.</div>";
+  html += "</div>"; 
+
+  html += "<script>";
+  html += "const systemPivot = document.getElementById('systemPivot');\n";
+  html += "const statusTextEl = document.getElementById('statusText');\n";
+  html += "const timerTextEl = document.getElementById('timerText');\n";
+  html += "const orientationDataEl = document.getElementById('orientationData');\n";
+  html += "const armButton = document.getElementById('armButton');\n";
+  html += "const disarmButton = document.getElementById('disarmButton');\n";
+
+  html += "const isArmed = " + String(systemArmed ? "true" : "false") + ";\n";
+  html += "const motionAlertActive = " + String(webShowsMotionActive ? "true" : "false") + ";\n";
+  html += "const currentMotionType = '" + String(lastMotionType) + "';\n";
+  html += "const remainingTime = " + String(timeRemaining_s) + ";\n";
+  html += "let R = " + String(systemArmed ? (currentRoll_deg - baseRoll_deg) : 0.0, 1) + ";\n";
+  html += "let P = " + String(systemArmed ? (currentPitch_deg - basePitch_deg) : 0.0, 1) + ";\n";
+  html += "let Y = " + String(systemArmed ? currentYaw_deg : 0.0, 1) + ";\n";
+
+  html += "if(systemPivot) { systemPivot.style.transform = 'rotateX(' + (-P) + 'deg) rotateY(' + (Y) + 'deg) rotateZ(' + (-R) + 'deg)'; }\n";
+  html += "if(orientationDataEl) { orientationDataEl.innerHTML = 'Roll: ' + R.toFixed(1) + '&deg;, Pitch: ' + P.toFixed(1) + '&deg;, Yaw: ' + Y.toFixed(1) + '&deg;<br>Yaw is gyro-based and will drift. Re-arm if needed.';}\n";
+
+  html += "if(isArmed){\n";
+  html += "  armButton.style.display = 'none'; disarmButton.style.display = 'inline-block';\n";
+  html += "  if(motionAlertActive){\n";
+  html += "    statusTextEl.textContent = 'ALERT: ' + currentMotionType.toUpperCase() + ' DETECTED!';\n";
+  html += "    statusTextEl.className = 'status-text status-alert';\n";
+  html += "  } else {\n";
+  html += "    statusTextEl.textContent = 'DRINK SECURE';\n";
+  html += "    statusTextEl.className = 'status-text status-armed';\n";
+  html += "  }\n";
+  html += "  let minutes = Math.floor(remainingTime / 60);\n";
+  html += "  let seconds = remainingTime % 60;\n";
+  html += "  timerTextEl.textContent = 'Armed for: ' + minutes + ':' + (seconds < 10 ? '0' : '') + seconds + (remainingTime <= 0 ? ' (Expired)' : '');\n";
+  html += "} else {\n";
+  html += "  armButton.style.display = 'inline-block'; disarmButton.style.display = 'none';\n";
+  html += "  statusTextEl.textContent = 'SYSTEM DISARMED';\n";
+  html += "  statusTextEl.className = 'status-text status-disarmed';\n";
+  html += "  timerTextEl.textContent = 'Press \\'Arm System\\' to begin monitoring.';\n";
+  html += "}\n";
+
+  html += "function armSystem() { fetch('/armsystem', { method: 'POST' }); }\n";
+  html += "function disarmSystem() { fetch('/disarmsystem', { method: 'POST' }); }\n";
+  html += "</script>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void serveNotFound() {
+  String message = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
+  // ... (similar not found page as before, can be kept)
+  message += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  message += "<title>404 Not Found</title>";
+  message += "<style>body{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;background-color:#f4f6f8;color:#333;margin:0;text-align:center;}";
+  message += ".message-box{padding:30px;background-color:white;border-radius:15px;box-shadow:0 6px 20px rgba(0,0,0,0.08);}";
+  message += "h1{color:#2c3e50; font-size:2em; margin-bottom:10px; font-weight:500;}";
+  message += "p{font-size:1em; margin-bottom:20px;}";
+  message += "a{color:#007aff;text-decoration:none;font-weight:500;} a:hover{text-decoration:underline;}</style></head>";
+  message += "<body><div class='message-box'><h1>404 - Not Found</h1><p>The page you are looking for doesn't exist.</p>";
+  message += "<p><a href='/'>Return to DrinkGuard</a></p></div></body></html>";
+  server.send(404, "text/html", message);
+}
